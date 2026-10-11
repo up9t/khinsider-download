@@ -7,14 +7,37 @@
 3. Create Benchmark
 4. Robust Telemetry
 
-I make two version to get the links:
-1. Copy paste version
-2. Scraper version
+## TODO LATER LATER
 
-## 1. Copy Paste Version
+1. Set a clear boundary to core logic
+2. Compile the core logic it to wasm, and load it with javascript to then copy paste in the browser!!! ISN'T THAT REALLY COOL?
 
-Just like the name, it is work by copy paste, It is copy paste the javascript code and paste it to the browser's console through developer tools
 
-## 2. Scraper Version
+There are two versions:
+1. Copy paste (simplest)
 
-Basically you does not need to open any browser, you just need the url of the target, and then put it in the .env file, and start with npm start, it'll automatically write the download urls also downloads the music files for you.
+    Just like the name, copy paste the javascript code and paste it to the browser's console through developer tools.
+
+2. Executable
+
+    1. Download the binary
+    2. Allow it to be executed
+
+        ```bash
+        chmod +x ./khd
+        ```
+
+    3. Run the binary
+        ```bash
+        ./khd <urls>
+
+        # example
+        # ./khd https://downloads.khinsider.com/game-soundtracks/album/plants-vs.-zombies
+        ```
+
+        > Note: It works with multiple urls too, just put them next to each other separated by space
+
+    4. Check in the `downloads` directory in the current directory.
+        ```bash
+        ls ./downloads
+        ```
