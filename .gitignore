@@ -1,2 +1,4 @@
 node_modules/
-ex.go
+ex/
+.vscode/
+kids/
