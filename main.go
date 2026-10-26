@@ -1,9 +1,8 @@
 package main
 
 import (
-	"encoding/json/jsontext"
-	"encoding/json/v2"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"iter"
@@ -13,7 +12,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -21,21 +19,21 @@ import (
 	"github.com/PuerkitoBio/goquery"
 )
 
+// NOTE TO SELF:
+// using pprof really helps with debugging waiting goroutines
+
 // var logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
 var logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
-var WorkerCounts = runtime.NumCPU()
 
 const DefaultOutDirectory = "./kids"
 const MaxJobsCountsAtTime = 100
 
 // TODO: make this a better way , maybe dynamically
 const Host = "https://downloads.khinsider.com"
+
 const (
-	HTTPHeaderUserAgent    = "Mozilla/5.0 (X11; Linux x86_64; rv:158.0) Gecko/20100101 Firefox/158.0"
-	HTTPHeaderAccept       = "text/html"
-	HTTPHeaderSecFetchDest = "document"
-	HTTPHeaderSecFetchMode = "navigate"
-	HTTPHeaderSecFetchSite = "same-origin"
+	DownloadFormatMP3 = iota
+	DownloadFormatFlac
 )
 
 type DownloadURLs struct {
@@ -43,45 +41,32 @@ type DownloadURLs struct {
 	Flac string `json:"flac"`
 }
 
-func ApplyHeaders(req *http.Request) {
-	req.Header.Set("User-Agent", HTTPHeaderUserAgent)
-	req.Header.Set("Accept", HTTPHeaderAccept)
-	// req.Header.Set("Referer", HTTPHeaderReferer)
-	req.Header.Set("Sec-Fetch-Dest", HTTPHeaderSecFetchDest)
-	req.Header.Set("Sec-Fetch-Mode", HTTPHeaderSecFetchMode)
-	req.Header.Set("Sec-Fetch-Site", HTTPHeaderSecFetchSite)
-}
-
 type StructWriter interface {
 	Write(v any) error
 }
 
-type Metadata struct {
+type Data struct {
 	Number   string `json:"number"`
 	SongName string `json:"song_name"`
 	Duration string `json:"duration"`
 	MP3Size  string `json:"mp3_size"`
 	FlacSize string `json:"flac_size"`
-	// PageLink     string `json:"page_link"` // this shouldn't be visible i think
+
 	DownloadURLs `json:"downloads_urls"`
+	// group for collector
+	Group string `json:"-"`
 }
 
-type JSONStructWriter struct {
-	w io.Writer
-}
+type DataQueueType = int
 
-func (jw JSONStructWriter) Write(v any) error {
-	return json.MarshalWrite(jw.w, v, jsontext.WithIndent("  "), jsontext.Multiline(true))
-}
+const (
+	Init DataQueueType = iota
+	Update
+)
 
-type Jobs struct {
-	Index    int
-	PageLink string
-}
-
-type DoneJobs struct {
-	Index int
-	DownloadURLs
+type DataQueue struct {
+	Type DataQueueType
+	Data *Data
 }
 
 func ParseURL(urls []string) ([]*url.URL, error) {
@@ -157,125 +142,32 @@ func GetDocument(client *http.Client, url *url.URL) (string, error) {
 	return document.String(), nil
 }
 
-// 1. write all the first results to a json file
-// pro:
-// - easier on internet usage
-// cons:
-// - user is given with unfinsihed urls
-
-// or 2. get to the final url first before writing it to json
+// get to the final url first before writing it to json
 // pro:
 // - user can immidiately the url they want to go
 // cons:
-// - also fetch unwanted urls
+// - fetch unwanted urls
 
 // slices is passed by value (copy), so I need to set the metadatas to use pointer
-func UpdateDownloadURLs(metadatas *[]Metadata, mu *sync.Mutex, doneJobs <-chan DoneJobs, wg *sync.WaitGroup) {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for job := range doneJobs {
-			mu.Lock()
-			(*metadatas)[job.Index].DownloadURLs = job.DownloadURLs
-			mu.Unlock()
-		}
-	}()
-}
 
-func ProcessInputURL(client *http.Client, url *url.URL, w StructWriter) {
+func GetDownloadPageURLs(client *http.Client, url *url.URL) (iter.Seq[[6]string], error) {
 	document, err := GetDocument(client, url)
-	wg := sync.WaitGroup{}
 
 	if err != nil {
-		logger.Error("Failed to get document", slog.Any("reason", err))
-		return
+		return nil, err
 	}
 
-	jobs := make(chan Jobs, MaxJobsCountsAtTime)
-	doneCh := make(chan DoneJobs)
-	getUrlFinish := make(chan struct{})
-
-	data := make([]Metadata, 0, 100)
-	dataMutex := sync.Mutex{}
-
-	// retrieve download url from doneChannel and update the `data` variable
-	UpdateDownloadURLs(&data, &dataMutex, doneCh, &wg)
-
-	// get download url and then send url to doneChannel
-	// this function should close the doneChannel after finish
-	go GetDownloadURL(client, jobs, doneCh, getUrlFinish)
-
-	// data ready -> wait visiting -> return url -> place it to data -> write
-	for i, meta := range GetDestinationURLFromDocument(document) {
-		dataMutex.Lock()
-		data = append(data, Metadata{
-			Number:   meta[0],
-			SongName: meta[1],
-			Duration: meta[2],
-			MP3Size:  meta[3],
-			FlacSize: meta[4],
-			// PageLink: Host + meta[5],
-		})
-		dataMutex.Unlock()
-
-		jobs <- Jobs{
-			Index:    i,
-			PageLink: Host + meta[5],
-		}
-
-	}
-
-	close(jobs)
-
-	<-getUrlFinish
-
-	close(doneCh)
-
-	wg.Wait()
-
-	// for _, d := range data {
-	if err := w.Write(data); err != nil {
-		logger.Warn("failed to write json", slog.Any("reason", err))
-	}
-	// }
+	return GetDownloadPageURLFromDocument(document), nil
 }
 
-func GetDownloadURL(client *http.Client, jobs <-chan Jobs, doneCh chan<- DoneJobs, finish chan<- struct{}) {
-	wg := sync.WaitGroup{}
+func GetDownloadURL(client *http.Client, url *url.URL) (DownloadURLs, error) {
+	document, err := GetDocument(client, url)
 
-	for i := 0; i < WorkerCounts; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			for job := range jobs {
-				u, err := url.Parse(job.PageLink)
-
-				if err != nil {
-					logger.Error("failed to parse page url", slog.Any("reason", err))
-					return
-				}
-
-				document, err := GetDocument(client, u)
-
-				if err != nil {
-					logger.Error("failed to get document", slog.Any("reason", err))
-					return
-				}
-
-				downloadURLs := GetDownloadURLFromDocument(document)
-
-				doneCh <- DoneJobs{
-					Index:        job.Index,
-					DownloadURLs: downloadURLs,
-				}
-			}
-		}()
+	if err != nil {
+		return DownloadURLs{}, err
 	}
 
-	wg.Wait()
-
-	finish <- struct{}{}
+	return GetDownloadURLFromDocument(document), nil
 }
 
 func GetDownloadURLFromDocument(document string) DownloadURLs {
@@ -309,7 +201,7 @@ func GetDownloadURLFromDocument(document string) DownloadURLs {
 }
 
 // get multiple urls from a html document
-func GetDestinationURLFromDocument(document string) iter.Seq2[int, [6]string] {
+func GetDownloadPageURLFromDocument(document string) iter.Seq[[6]string] {
 	reader := strings.NewReader(document)
 
 	doc, err := goquery.NewDocumentFromReader(reader)
@@ -319,7 +211,10 @@ func GetDestinationURLFromDocument(document string) iter.Seq2[int, [6]string] {
 		return nil
 	}
 
-	return func(yield func(int, [6]string) bool) {
+	// document title
+	// #pageContent > h2:nth-child(2)
+
+	return func(yield func([6]string) bool) {
 		doc.Find("#songlist > tbody > tr").Slice(1, -1).Each(func(i int, row *goquery.Selection) {
 			td := row.Find("td")
 
@@ -332,7 +227,7 @@ func GetDestinationURLFromDocument(document string) iter.Seq2[int, [6]string] {
 			songPageLink, ok := td.Find("a").Attr("href")
 
 			if ok {
-				if !yield(i, [6]string{number, songName, duration, mp3Size, flacSize, songPageLink}) {
+				if !yield([6]string{number, songName, duration, mp3Size, flacSize, songPageLink}) {
 					return
 				}
 			} else {
@@ -342,17 +237,50 @@ func GetDestinationURLFromDocument(document string) iter.Seq2[int, [6]string] {
 	}
 }
 
+func CreateDirectoryIfNotExists(dirname string) error {
+	stat, err := os.Stat(dirname)
+
+	if errors.Is(err, os.ErrNotExist) {
+		logger.Info("Directory doesn't exists, creating output directory", slog.String("directory", dirname))
+
+		// apparently you need the x (execute) permission in directory
+		// which is slightly different from what is known in file permission
+		if err := os.MkdirAll(dirname, 0755); err != nil {
+			return fmt.Errorf("Failed to create output directory: %s%w\n", dirname, err)
+		}
+
+	} else if err != nil {
+		return fmt.Errorf("Failed to get the stat of the output directory %s%w\n", dirname, err)
+	} else if !stat.IsDir() {
+		return fmt.Errorf("Output directory is not a directory: %s", dirname)
+	}
+
+	return nil
+}
+
 // example: ./kid https://xxxxxxx
 // or maybe: ./kid download https://xxxxxxx
 // kid help, kid -h, kid
 // kid fetch xxx --> to fetch only
+// WILL download mp3 by default, can be set with
+// --format mp3, --format flac
 // kid download --> fetch and download
-// kid download -f file1 file2--> if -f specified download only, from files
+// kid download -f file1 file2--> if -f --file specified download only, from files
 // kid download -o --> output directory/file
 // -- if multiple urls after -o xxx, then o = output directory
 // -- if only one url after -o xxx, then o = output file
 func main() {
+	// if len(os.Args) > 0 {
+	// 	subcommand = os.Args[1]
+	// }
+
+	// return
+
 	urls := os.Args[1:]
+
+	// one thing I realized, when we execute the binary with -h flag
+	// the code below .Parse() will not be executed
+	flag.Parse()
 
 	parsedURLs, err := ParseURL(urls)
 
@@ -376,56 +304,294 @@ func main() {
 
 	outdir := DefaultOutDirectory
 
-	// create directory if not exists
-	stat, err := os.Stat(outdir)
-	if errors.Is(err, os.ErrNotExist) {
-		logger.Info("Directory doesn't exists, creating output directory", slog.String("directory", outdir))
+	if err := CreateDirectoryIfNotExists(outdir); err != nil {
+		logger.Error("Failed to create directory",
+			slog.Any("reason", err))
+		return
+	}
 
-		// apparently you need the x (execute) permission in directory
-		// which is slightly different from what in know in file permission
-		if err := os.MkdirAll(outdir, 0755); err != nil {
-			logger.Error("Failed to create output directory",
-				slog.String("directory", outdir),
-				slog.Any("reason", err),
-			)
+	type Stat struct {
+		Group string
+		Total int
+	}
+
+	type DownloadQueue struct {
+		Group string
+		Name  string
+		Url   *url.URL
+	}
+
+	type WriteQueue struct {
+		Group string
+		Data  []Data
+	}
+
+	// visit download page url -> visit and get download url -> update data -> write to file
+	statChange := make(chan Stat)
+	visitPageQueue := make(chan *url.URL, 5)
+	visitDownloadQueue := make(chan DownloadQueue, 10)
+	dataQueue := make(chan DataQueue, 40)
+	collectorQueue := make(chan *Data, 5)
+	writeQueue := make(chan WriteQueue, 5)
+
+	dataProducerGroup := sync.WaitGroup{}
+
+	wg.Go(func() {
+		defer close(visitPageQueue)
+
+		for _, url := range parsedURLs {
+			visitPageQueue <- url
 		}
-	} else if err != nil {
-		logger.Error("Failed to get the stat of the output directory",
-			slog.String("directory", outdir),
-			slog.Any("reason", err),
-		)
-		return
-	} else if !stat.IsDir() {
-		logger.Error("Output directory is not a directory",
-			slog.String("file", outdir),
-			slog.String("action", "Delete or move the file"),
-		)
-		return
-	}
+	})
 
-	for _, url := range parsedURLs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			logger.Info("Searching", slog.String("url", url.String()))
+	// visit main page
+	dataProducerGroup.Add(1)
+	wg.Go(func() {
+		workerCount := 5
 
-			outname := filepath.Join(outdir, path.Base(url.Path)) + ".json"
+		wgg := sync.WaitGroup{}
+		wgg.Add(workerCount)
 
-			f, err := os.OpenFile(outname, os.O_CREATE|os.O_WRONLY, 0644)
+		defer close(visitDownloadQueue)
+		defer close(statChange)
+		defer dataProducerGroup.Done()
 
-			if err != nil {
-				logger.Error("failed to open file",
-					slog.String("filename", outname),
-					slog.Any("reason", err),
-				)
-				return
+		for range workerCount {
+			go func() {
+				defer wgg.Done()
+
+				for url := range visitPageQueue {
+					logger.Info("Searching", slog.String("url", url.String()))
+
+					filename := filepath.Join(outdir, path.Base(url.Path)) + ".json"
+
+					// create output file to test permission
+					file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0644)
+					if err != nil {
+						logger.Error("failed to open file",
+							slog.String("filename", filename),
+							slog.Any("reason", err),
+						)
+						return
+					}
+					file.Close()
+
+					result, err := GetDownloadPageURLs(&client, url)
+
+					if err != nil {
+						logger.Error("failed to get download page urls",
+							slog.Any("reason", err),
+						)
+					}
+
+					total := 0
+
+					for r := range result {
+						uri := Host + r[5]
+						url, err := url.Parse(uri)
+
+						if err != nil {
+							logger.Error("failed to parse url",
+								slog.String("url", uri),
+								slog.Any("reason", err),
+							)
+							continue
+						}
+
+						total += 1
+
+						statChange <- Stat{
+							Group: filename,
+							Total: total,
+						}
+						visitDownloadQueue <- DownloadQueue{
+							Group: filename,
+							Name:  r[1],
+							Url:   url,
+						}
+						dataQueue <- DataQueue{
+							Type: Init,
+							Data: &Data{
+								Group:    filename,
+								Number:   r[0],
+								SongName: r[1],
+								Duration: r[2],
+								MP3Size:  r[3],
+								FlacSize: r[4],
+							},
+						}
+					}
+
+				}
+			}()
+		}
+
+		wgg.Wait()
+	})
+
+	// visit download page
+	dataProducerGroup.Add(1)
+	wg.Go(func() {
+		workerCount := 5
+
+		wgg := sync.WaitGroup{}
+		wgg.Add(workerCount)
+
+		defer dataProducerGroup.Done()
+
+		for range workerCount {
+			go func() {
+				defer wgg.Done()
+
+				for downloadQueue := range visitDownloadQueue {
+
+					downUrl, err := GetDownloadURL(&client, downloadQueue.Url)
+
+					if err != nil {
+						logger.Error("failed to get download url",
+							slog.String("url", downloadQueue.Url.String()),
+							slog.Any("reason", err),
+						)
+					}
+
+					dataQueue <- DataQueue{
+						Type: Update,
+						Data: &Data{
+							SongName:     downloadQueue.Name,
+							Group:        downloadQueue.Group,
+							DownloadURLs: downUrl,
+						},
+					}
+				}
+			}()
+		}
+
+		wgg.Wait()
+	})
+
+	// retrieve download url and update the `data` variable
+	wg.Go(func() {
+		// url 1:
+		// - song name: [song data]  (fast lookup)
+		dataMap := make(map[string]map[string]*Data)
+		defer close(collectorQueue)
+
+		for data := range dataQueue {
+			switch data.Type {
+			case Init:
+				group, ok := dataMap[data.Data.Group]
+
+				if !ok {
+					group = make(map[string]*Data)
+					dataMap[data.Data.Group] = group
+				}
+
+				group[data.Data.SongName] = data.Data
+			case Update:
+				group := dataMap[data.Data.Group]
+				result := group[data.Data.SongName]
+				result.DownloadURLs = data.Data.DownloadURLs
+
+				collectorQueue <- result
+
+				delete(dataMap[data.Data.Group], data.Data.SongName)
 			}
+		}
+	})
 
-			jsonw := JSONStructWriter{w: f}
-			ProcessInputURL(&client, url, jsonw)
-		}()
-	}
+	// collector
+	wg.Go(func() {
+		group := make(map[string][]Data)
+		stats := make(map[string]Stat)
+		defer close(writeQueue)
+
+		ca := true
+		cb := true
+
+		for ca || cb {
+			select {
+			case stat, ok := <-statChange:
+				if !ok {
+					ca = false
+					continue
+				}
+
+				stats[stat.Group] = stat
+			case collect, ok := <-collectorQueue:
+				if !ok {
+					cb = false
+					continue
+				}
+
+				// just because group[collect.Group] is a slice, doesn't mean group[collect.Group]
+				// will automatically reflect variable g
+				// you need to assign it again after doing operation of g
+				g := group[collect.Group]
+				// idk if using * is a good idea
+				g = append(g, *collect)
+
+				group[collect.Group] = g
+
+				if len(g) >= stats[collect.Group].Total {
+					// TODO: sort the result
+					// this function doesn't work because "2" is bigger than "10"
+					// slices.SortFunc(g, func(a Data, b Data) int {
+					// 	return cmp.Compare(a.Number, b.Number)
+					// })
+
+					writeQueue <- WriteQueue{
+						Group: collect.Group,
+						Data:  g,
+					}
+					delete(group, collect.Group)
+				}
+			}
+		}
+	})
+
+	// write
+	wg.Go(func() {
+		workerCount := 5
+
+		wgg := sync.WaitGroup{}
+		wgg.Add(workerCount)
+
+		for range workerCount {
+			go func() {
+				defer wgg.Done()
+				for write := range writeQueue {
+					filename := write.Group
+
+					file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0644)
+					if err != nil {
+						logger.Error("failed to open file",
+							slog.String("filename", filename),
+							slog.Any("reason", err),
+						)
+						return
+					}
+					defer file.Close()
+
+					jsonw := NewJSONStructWriter(file)
+
+					// json.MarshalWrite(os.Stdout, write.Data, jsontext.WithIndent("  "), jsontext.Multiline(true))
+
+					if err := jsonw.Write(write.Data); err != nil {
+						logger.Warn("failed to write json", slog.Any("reason", err))
+					}
+				}
+			}()
+		}
+
+		wgg.Wait()
+	})
+
+	wg.Go(func() {
+		dataProducerGroup.Wait()
+		close(dataQueue)
+	})
 
 	wg.Wait()
+
 	logger.Info("Done!")
 }
