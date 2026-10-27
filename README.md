@@ -1,13 +1,51 @@
-# Khinsider Scraper
+# Khinsider Downloader
 
-I make two version to get the links:
-1. Copy paste version
-2. Scraper version
+An **Ultra Fast** Playlist Downloader which downloads every song in a playlist from khinsider.com without needed to login to their website.
 
-### 1. Copy Paste Version
+## Todo
 
-Just like the name, it is work by copy paste, It is copy paste the javascript code and paste it to the browser's console through developer tools
+<!-- 1. Make it work -->
+2. Create Tests
+3. Create Benchmark
+4. Robust Telemetry
 
-### 2. Scraper Version
+## TODO LATER LATER
 
-Basically you does not need to open any browser, you just need the url of the target, and then put it in the .env file, and start with npm start, it'll automatically write the download urls also downloads the music files for you.
+1. Set a clear boundary to core logic
+2. Compile the core logic it to wasm, and load it with javascript to then copy paste in the browser!!! ISN'T THAT REALLY COOL?
+
+
+## Build 
+
+```bash
+go build -o kid .
+```
+
+There are two versions:
+1. Copy paste (simplest)
+
+    Just like the name, copy paste the javascript code and paste it to the browser's console through developer tools.
+
+2. Executable
+
+    1. Download the binary
+    2. Allow it to be executed
+
+        ```bash
+        chmod +x ./kid
+        ```
+
+    3. Run the binary
+        ```bash
+        ./kid <urls>
+
+        # example
+        # ./kid https://downloads.khinsider.com/game-soundtracks/album/plants-vs.-zombies
+        ```
+
+        > Note: It works with multiple urls too, just put them next to each other separated by space
+
+    4. Check in the `downloads` directory in the current directory.
+        ```bash
+        ls ./downloads
+        ```

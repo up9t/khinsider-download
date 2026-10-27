@@ -1,5 +1,6 @@
-urls/
 node_modules/
+ex/
+.vscode/
+kids/
 downloads/
-dist/
-README.md
+kid
