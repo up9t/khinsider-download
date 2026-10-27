@@ -1,8 +1,10 @@
-# Khinsider Scraper
+# Khinsider Downloader
+
+An **Ultra Fast** Playlist Downloader which downloads every song in a playlist from khinsider.com without needed to login to their website.
 
 ## Todo
 
-1. Make it work
+<!-- 1. Make it work -->
 2. Create Tests
 3. Create Benchmark
 4. Robust Telemetry
@@ -12,6 +14,12 @@
 1. Set a clear boundary to core logic
 2. Compile the core logic it to wasm, and load it with javascript to then copy paste in the browser!!! ISN'T THAT REALLY COOL?
 
+
+## Build 
+
+```bash
+go build -o kid .
+```
 
 There are two versions:
 1. Copy paste (simplest)
@@ -24,15 +32,15 @@ There are two versions:
     2. Allow it to be executed
 
         ```bash
-        chmod +x ./khd
+        chmod +x ./kid
         ```
 
     3. Run the binary
         ```bash
-        ./khd <urls>
+        ./kid <urls>
 
         # example
-        # ./khd https://downloads.khinsider.com/game-soundtracks/album/plants-vs.-zombies
+        # ./kid https://downloads.khinsider.com/game-soundtracks/album/plants-vs.-zombies
         ```
 
         > Note: It works with multiple urls too, just put them next to each other separated by space

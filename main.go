@@ -1,6 +1,8 @@
 package main
 
 import (
+	"cmp"
+	"encoding/json/v2"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +28,8 @@ import (
 // var logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
 var logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-const DefaultOutDirectory = "./kids"
+const DefaultOutDataDirectory = "./kids"
+const DefaultOutDownloadDirectory = "./downloads"
 const MaxJobsCountsAtTime = 100
 
 // TODO: make this a better way , maybe dynamically
@@ -45,8 +49,12 @@ type StructWriter interface {
 	Write(v any) error
 }
 
+type StructReader interface {
+	Read()
+}
+
 type Data struct {
-	Number   string `json:"number"`
+	Number   int    `json:"number"`
 	SongName string `json:"song_name"`
 	Duration string `json:"duration"`
 	MP3Size  string `json:"mp3_size"`
@@ -67,6 +75,29 @@ const (
 type DataQueue struct {
 	Type DataQueueType
 	Data *Data
+}
+
+type Stat struct {
+	Group string
+	Total int
+}
+
+type VisitDownloadQueue struct {
+	Group string
+	Name  string
+	Url   *url.URL
+}
+
+type WriteQueue struct {
+	Group string
+	Data  []Data
+}
+
+type Filename = string
+
+type DownloadQueue struct {
+	OutPath string
+	URL     *url.URL
 }
 
 func ParseURL(urls []string) ([]*url.URL, error) {
@@ -183,15 +214,16 @@ func GetDownloadURLFromDocument(document string) DownloadURLs {
 	mp3URL, ok := doc.Find("#pageContent > p:nth-child(9) > a:nth-child(1)").Attr("href")
 
 	if !ok {
-		logger.Warn("failed to retrieve href attribute")
+		// logger.Warn("failed to retrieve href attribute for mp3")
 		return DownloadURLs{}
 	}
 
+	// not every song have flac download so, p:nth-child(10) may not be available
 	flacURL, ok := doc.Find("#pageContent > p:nth-child(10) > a:nth-child(1)").Attr("href")
 
 	if !ok {
-		logger.Warn("failed to retrieve href attribute")
-		return DownloadURLs{}
+		// logger.Warn("failed to retrieve href attribute for flac")
+		flacURL = ""
 	}
 
 	return DownloadURLs{
@@ -214,15 +246,41 @@ func GetDownloadPageURLFromDocument(document string) iter.Seq[[6]string] {
 	// document title
 	// #pageContent > h2:nth-child(2)
 
+	hasNumber := 0
+	hasMp3 := 0
+	hasFlac := 0
+
+	doc.Find("#songlist_header > th").Each(func(i int, s *goquery.Selection) {
+		switch strings.ToLower(s.Text()) {
+		case "#":
+			hasNumber = 1
+		case "mp3":
+			hasMp3 = 1
+		case "flac":
+			hasFlac = 1
+		}
+	})
+
 	return func(yield func([6]string) bool) {
 		doc.Find("#songlist > tbody > tr").Slice(1, -1).Each(func(i int, row *goquery.Selection) {
 			td := row.Find("td")
 
-			number := td.Eq(1).Text()
-			songName := td.Eq(2).Text()
-			duration := td.Eq(3).Text()
-			mp3Size := td.Eq(4).Text()
-			flacSize := td.Eq(5).Text()
+			number := fmt.Sprint(i + 1)
+
+			songName := td.Eq(hasNumber + 1).Text()
+			duration := td.Eq(hasNumber + 2).Text()
+			mp3Size := ""
+
+			if hasMp3 == 1 {
+				mp3Size = td.Eq(hasNumber + 3).Text()
+			}
+
+			flacSize := ""
+
+			if hasFlac == 1 {
+				flacSize = td.Eq(hasNumber + hasMp3 + 3).Text()
+			}
+
 			// this link goes to another url, and there is an actual download url in that page
 			songPageLink, ok := td.Find("a").Attr("href")
 
@@ -275,6 +333,12 @@ func main() {
 	// }
 
 	// return
+	start := time.Now()
+
+	defer func() {
+		duration := time.Since(start)
+		logger.Info("Done!", slog.String("duration", duration.String()))
+	}()
 
 	urls := os.Args[1:]
 
@@ -302,37 +366,25 @@ func main() {
 	// stage 3 -> donwload the given url with tcp stream
 	wg := sync.WaitGroup{}
 
-	outdir := DefaultOutDirectory
+	outdatadir := DefaultOutDataDirectory
+	outDownloadDir := DefaultOutDownloadDirectory
 
-	if err := CreateDirectoryIfNotExists(outdir); err != nil {
+	if err := CreateDirectoryIfNotExists(outdatadir); err != nil {
 		logger.Error("Failed to create directory",
 			slog.Any("reason", err))
 		return
 	}
 
-	type Stat struct {
-		Group string
-		Total int
-	}
-
-	type DownloadQueue struct {
-		Group string
-		Name  string
-		Url   *url.URL
-	}
-
-	type WriteQueue struct {
-		Group string
-		Data  []Data
-	}
-
-	// visit download page url -> visit and get download url -> update data -> write to file
+	// visit download page url -> visit and get download url -> update data -> write to file -> read and parse the file -> download
+	// adjust the number, I just put the number feeling-ly there
 	statChange := make(chan Stat)
 	visitPageQueue := make(chan *url.URL, 5)
-	visitDownloadQueue := make(chan DownloadQueue, 10)
+	visitDownloadQueue := make(chan VisitDownloadQueue, 40)
 	dataQueue := make(chan DataQueue, 40)
 	collectorQueue := make(chan *Data, 5)
 	writeQueue := make(chan WriteQueue, 5)
+	readQueue := make(chan Filename, 2)
+	downloadQueue := make(chan DownloadQueue, 5)
 
 	dataProducerGroup := sync.WaitGroup{}
 
@@ -363,7 +415,7 @@ func main() {
 				for url := range visitPageQueue {
 					logger.Info("Searching", slog.String("url", url.String()))
 
-					filename := filepath.Join(outdir, path.Base(url.Path)) + ".json"
+					filename := filepath.Join(outdatadir, path.Base(url.Path)) + ".json"
 
 					// create output file to test permission
 					file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0644)
@@ -385,8 +437,10 @@ func main() {
 					}
 
 					total := 0
+					i := 0
 
 					for r := range result {
+						i += 1
 						uri := Host + r[5]
 						url, err := url.Parse(uri)
 
@@ -400,20 +454,22 @@ func main() {
 
 						total += 1
 
-						statChange <- Stat{
-							Group: filename,
-							Total: total,
-						}
-						visitDownloadQueue <- DownloadQueue{
+						// statChange <- Stat{
+						// 	Group: filename,
+						// 	Total: total,
+						// }
+
+						visitDownloadQueue <- VisitDownloadQueue{
 							Group: filename,
 							Name:  r[1],
 							Url:   url,
 						}
+
 						dataQueue <- DataQueue{
 							Type: Init,
 							Data: &Data{
 								Group:    filename,
-								Number:   r[0],
+								Number:   i,
 								SongName: r[1],
 								Duration: r[2],
 								MP3Size:  r[3],
@@ -422,6 +478,10 @@ func main() {
 						}
 					}
 
+					statChange <- Stat{
+						Group: filename,
+						Total: total,
+					}
 				}
 			}()
 		}
@@ -443,13 +503,13 @@ func main() {
 			go func() {
 				defer wgg.Done()
 
-				for downloadQueue := range visitDownloadQueue {
+				for visitDownload := range visitDownloadQueue {
 
-					downUrl, err := GetDownloadURL(&client, downloadQueue.Url)
+					downUrl, err := GetDownloadURL(&client, visitDownload.Url)
 
 					if err != nil {
 						logger.Error("failed to get download url",
-							slog.String("url", downloadQueue.Url.String()),
+							slog.String("url", visitDownload.Url.String()),
 							slog.Any("reason", err),
 						)
 					}
@@ -457,8 +517,8 @@ func main() {
 					dataQueue <- DataQueue{
 						Type: Update,
 						Data: &Data{
-							SongName:     downloadQueue.Name,
-							Group:        downloadQueue.Group,
+							SongName:     visitDownload.Name,
+							Group:        visitDownload.Group,
 							DownloadURLs: downUrl,
 						},
 					}
@@ -505,21 +565,21 @@ func main() {
 		stats := make(map[string]Stat)
 		defer close(writeQueue)
 
-		ca := true
-		cb := true
+		statWait := true
+		collectWait := true
 
-		for ca || cb {
+		for statWait || collectWait {
 			select {
 			case stat, ok := <-statChange:
 				if !ok {
-					ca = false
+					statWait = false
 					continue
 				}
 
 				stats[stat.Group] = stat
 			case collect, ok := <-collectorQueue:
 				if !ok {
-					cb = false
+					collectWait = false
 					continue
 				}
 
@@ -532,12 +592,10 @@ func main() {
 
 				group[collect.Group] = g
 
-				if len(g) >= stats[collect.Group].Total {
-					// TODO: sort the result
-					// this function doesn't work because "2" is bigger than "10"
-					// slices.SortFunc(g, func(a Data, b Data) int {
-					// 	return cmp.Compare(a.Number, b.Number)
-					// })
+				if _, ok := stats[collect.Group]; ok && len(g) >= stats[collect.Group].Total {
+					slices.SortFunc(g, func(a Data, b Data) int {
+						return cmp.Compare(a.Number, b.Number)
+					})
 
 					writeQueue <- WriteQueue{
 						Group: collect.Group,
@@ -555,6 +613,7 @@ func main() {
 
 		wgg := sync.WaitGroup{}
 		wgg.Add(workerCount)
+		defer close(readQueue)
 
 		for range workerCount {
 			go func() {
@@ -562,7 +621,7 @@ func main() {
 				for write := range writeQueue {
 					filename := write.Group
 
-					file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0644)
+					file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 					if err != nil {
 						logger.Error("failed to open file",
 							slog.String("filename", filename),
@@ -570,20 +629,159 @@ func main() {
 						)
 						return
 					}
-					defer file.Close()
 
 					jsonw := NewJSONStructWriter(file)
 
-					// json.MarshalWrite(os.Stdout, write.Data, jsontext.WithIndent("  "), jsontext.Multiline(true))
-
 					if err := jsonw.Write(write.Data); err != nil {
-						logger.Warn("failed to write json", slog.Any("reason", err))
+						logger.Error("failed to write json", slog.Any("reason", err))
+						file.Close()
+						continue
 					}
+
+					file.Close()
+
+					readQueue <- filename
 				}
 			}()
 		}
 
 		wgg.Wait()
+	})
+
+	// read
+	wg.Go(func() {
+		defer close(downloadQueue)
+
+		for filename := range readQueue {
+			file, err := os.Open(filename)
+
+			if err != nil {
+				logger.Error("failed to open file",
+					slog.String("filename", filename),
+					slog.Any("reason", err),
+				)
+
+				continue
+			}
+
+			data := make([]Data, 0, 10)
+
+			// TODO: using this is good, but maybe add a little abstraction so it stays consistent with the writer
+			if err := json.UnmarshalRead(file, &data); err != nil {
+				logger.Error("failed to read file",
+					slog.String("filename", filename),
+					slog.Any("reason", err),
+				)
+
+				file.Close()
+
+				continue
+			}
+
+			outdir := filepath.Join(outDownloadDir, filepath.Base(filename))
+
+			entries, _ := os.ReadDir(outdir)
+
+			// cache, download only the needed file
+			existsMap := make(map[string]struct{})
+
+			for _, entry := range entries {
+				existsMap[entry.Name()] = struct{}{}
+			}
+
+			// send each data
+			for _, d := range data {
+				// TODO: dyanmically choose either flac/mp3 based on user choice, fallback to mp3 if flac unavailable
+				filename := d.SongName + ".mp3"
+				outpath := filepath.Join(outdir, filename)
+				url, err := url.Parse(d.DownloadURLs.MP3)
+
+				if err != nil {
+					logger.Error("failed to parse download url",
+						slog.String("url", d.DownloadURLs.MP3),
+						slog.Any("reason", err),
+					)
+					continue
+				}
+
+				if _, exists := existsMap[filename]; !exists {
+					downloadQueue <- DownloadQueue{
+						OutPath: outpath,
+						URL:     url,
+					}
+				}
+			}
+
+			file.Close()
+		}
+	})
+
+	// download
+	wg.Go(func() {
+		workerCount := 5
+
+		wgg := sync.WaitGroup{}
+		wgg.Add(workerCount)
+
+		for range workerCount {
+			go func() {
+				wgg.Done()
+				// TODO: USE FOR (THE COMMENTED LINE BELOW)
+				// if download, ok := <-downloadQueue; ok {
+				for download := range downloadQueue {
+					func() {
+						url := download.URL.String()
+						resp, err := client.Get(url)
+
+						if err != nil {
+							logger.Error("failed to download",
+								slog.String("url", url),
+								slog.Any("reason", err),
+							)
+
+							return
+						}
+
+						defer resp.Body.Close()
+
+						dir := filepath.Dir(download.OutPath)
+
+						if err := CreateDirectoryIfNotExists(dir); err != nil {
+							logger.Error("failed to create directory",
+								slog.String("directory", dir),
+								slog.Any("reason", err),
+							)
+
+							return
+						}
+
+						file, err := os.OpenFile(download.OutPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY|os.O_TRUNC, 0644)
+
+						if err != nil {
+							logger.Error("failed to open file",
+								slog.String("file", download.OutPath),
+								slog.Any("reason", err),
+							)
+
+							return
+						}
+
+						defer file.Close()
+
+						if _, err = io.Copy(file, resp.Body); err != nil {
+							logger.Error("failed to write downloaded bytes to a file",
+								slog.String("file", download.OutPath),
+								slog.Any("reason", err),
+							)
+
+							// remove unfinished file
+							os.Remove(download.OutPath)
+							return
+						}
+					}()
+				}
+			}()
+		}
 	})
 
 	wg.Go(func() {
@@ -592,6 +790,4 @@ func main() {
 	})
 
 	wg.Wait()
-
-	logger.Info("Done!")
 }
