@@ -431,9 +431,11 @@ func main() {
 					result, err := GetDownloadPageURLs(&client, url)
 
 					if err != nil {
+						// TODO: implement backoff instead of directly returns nothing
 						logger.Error("failed to get download page urls",
 							slog.Any("reason", err),
 						)
+						continue
 					}
 
 					total := 0
