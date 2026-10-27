@@ -766,6 +766,10 @@ func main() {
 
 						defer file.Close()
 
+						logger.Info("Downloading",
+							slog.String("name", filepath.Base(download.OutPath)),
+						)
+
 						if _, err = io.Copy(file, resp.Body); err != nil {
 							logger.Error("failed to write downloaded bytes to a file",
 								slog.String("file", download.OutPath),
