@@ -725,9 +725,7 @@ func main() {
 
 		for range workerCount {
 			go func() {
-				wgg.Done()
-				// TODO: USE FOR (THE COMMENTED LINE BELOW)
-				// if download, ok := <-downloadQueue; ok {
+				defer wgg.Done()
 				for download := range downloadQueue {
 					func() {
 						url := download.URL.String()
@@ -782,6 +780,8 @@ func main() {
 				}
 			}()
 		}
+
+		wgg.Wait()
 	})
 
 	wg.Go(func() {
