@@ -2,6 +2,7 @@ package main
 
 import (
 	"cmp"
+	"context"
 	"encoding/json/v2"
 	"errors"
 	"flag"
@@ -12,11 +13,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -100,7 +103,7 @@ type DownloadQueue struct {
 	URL     *url.URL
 }
 
-func ParseURL(urls []string) ([]*url.URL, error) {
+func ParseURLs(urls []string) ([]*url.URL, error) {
 	result := make([]*url.URL, 0, len(urls))
 
 	for _, ur := range urls {
@@ -127,31 +130,29 @@ func ParseURL(urls []string) ([]*url.URL, error) {
 
 // returns the whole html document in string
 func GetDocument(client *http.Client, url *url.URL) (string, error) {
-	//  *http.Request shouldn't be reused.
+	//  NOTE TO SELF:
+	// *http.Request shouldn't be reused.
 	req, err := http.NewRequest(http.MethodGet, url.String(), nil)
 
 	ApplyHeaders(req)
 
 	if err != nil {
-		return "", fmt.Errorf("Failed to construct a new HTTP request. %w", err)
+		return "", fmt.Errorf("failed to construct a new HTTP request. %w", err)
 	}
 
 	res, err := client.Do(req)
 
 	if err != nil {
-		return "", fmt.Errorf("Failed to perform HTTP request. %w", err)
+		return "", fmt.Errorf("failed to perform HTTP request. %w", err)
 	}
 
 	if res.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("http request failed with status: %d", res.StatusCode)
 	}
 
+	// NOTE TO SELF:
 	// Must always close the response body, because it's a stream, as the documentation said
 	defer res.Body.Close()
-
-	// Note to self
-	// make a readable stream of string
-	// strings.NewReader()
 
 	// then we need to stream data from HTTP Response to In memory variable
 	// 1. make a writable stream of string
@@ -167,20 +168,13 @@ func GetDocument(client *http.Client, url *url.URL) (string, error) {
 	_, err = io.Copy(&document, res.Body)
 
 	if err != nil {
-		return "", fmt.Errorf("Failed to read and write stream data. %w", err)
+		return "", fmt.Errorf("failed to read and write stream data. %w", err)
 	}
 
 	return document.String(), nil
 }
 
-// get to the final url first before writing it to json
-// pro:
-// - user can immidiately the url they want to go
-// cons:
-// - fetch unwanted urls
-
-// slices is passed by value (copy), so I need to set the metadatas to use pointer
-
+// NOTE TO SELF (DELETE LATER): slices is passed by value (copy), so I need to set the metadatas to use pointer
 func GetDownloadPageURLs(client *http.Client, url *url.URL) (iter.Seq[[6]string], error) {
 	document, err := GetDocument(client, url)
 
@@ -214,7 +208,6 @@ func GetDownloadURLFromDocument(document string) DownloadURLs {
 	mp3URL, ok := doc.Find("#pageContent > p:nth-child(9) > a:nth-child(1)").Attr("href")
 
 	if !ok {
-		// logger.Warn("failed to retrieve href attribute for mp3")
 		return DownloadURLs{}
 	}
 
@@ -222,7 +215,6 @@ func GetDownloadURLFromDocument(document string) DownloadURLs {
 	flacURL, ok := doc.Find("#pageContent > p:nth-child(10) > a:nth-child(1)").Attr("href")
 
 	if !ok {
-		// logger.Warn("failed to retrieve href attribute for flac")
 		flacURL = ""
 	}
 
@@ -301,16 +293,17 @@ func CreateDirectoryIfNotExists(dirname string) error {
 	if errors.Is(err, os.ErrNotExist) {
 		logger.Info("Directory doesn't exists, creating output directory", slog.String("directory", dirname))
 
+		// NOTE TO SELF:
 		// apparently you need the x (execute) permission in directory
 		// which is slightly different from what is known in file permission
 		if err := os.MkdirAll(dirname, 0755); err != nil {
-			return fmt.Errorf("Failed to create output directory: %s%w\n", dirname, err)
+			return fmt.Errorf("failed to create output directory: %s%w", dirname, err)
 		}
 
 	} else if err != nil {
-		return fmt.Errorf("Failed to get the stat of the output directory %s%w\n", dirname, err)
+		return fmt.Errorf("failed to get the stat of the output directory %s%w", dirname, err)
 	} else if !stat.IsDir() {
-		return fmt.Errorf("Output directory is not a directory: %s", dirname)
+		return fmt.Errorf("output directory is not a directory: %s", dirname)
 	}
 
 	return nil
@@ -328,12 +321,14 @@ func CreateDirectoryIfNotExists(dirname string) error {
 // -- if multiple urls after -o xxx, then o = output directory
 // -- if only one url after -o xxx, then o = output file
 func main() {
-	// if len(os.Args) > 0 {
-	// 	subcommand = os.Args[1]
-	// }
-
-	// return
 	start := time.Now()
+
+	// NOTE TO SELF:
+	// the reason why Interrupt signal is in the os package is because it is available in all operating systems (windows, linux, mac)
+	// while SIGTERM, we use syscall.SIGTERM, because it is a UNIX standard (no windows)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+
+	defer stop()
 
 	defer func() {
 		duration := time.Since(start)
@@ -342,16 +337,18 @@ func main() {
 
 	urls := os.Args[1:]
 
+	// NOTE TO SELF:
 	// one thing I realized, when we execute the binary with -h flag
 	// the code below .Parse() will not be executed
 	flag.Parse()
 
-	parsedURLs, err := ParseURL(urls)
+	parsedURLs, err := ParseURLs(urls)
 
 	if err != nil {
 		logger.Error("Failed to parse URLs.", slog.Any("urls", urls))
 	}
 
+	// NOTE TO SELF:
 	// Go's http.Get function doesn't allow to set headers
 	// we need other way by constructing http.Client then client.Do
 	// or directly using http.DefaultClient.Do
@@ -360,10 +357,6 @@ func main() {
 		Timeout: 30 * time.Second,
 	}
 
-	// make a buffered channel
-	// stage 1 -> visit url, parse document, return download page urls
-	// stage 2 -> visit url, parse document, return download url
-	// stage 3 -> donwload the given url with tcp stream
 	wg := sync.WaitGroup{}
 
 	outdatadir := DefaultOutDataDirectory
@@ -376,7 +369,7 @@ func main() {
 	}
 
 	// visit download page url -> visit and get download url -> update data -> write to file -> read and parse the file -> download
-	// adjust the number, I just put the number feeling-ly there
+	// adjust the number, I just put the number intuitively there
 	statChange := make(chan Stat)
 	visitPageQueue := make(chan *url.URL, 5)
 	visitDownloadQueue := make(chan VisitDownloadQueue, 40)
@@ -386,13 +379,29 @@ func main() {
 	readQueue := make(chan Filename, 2)
 	downloadQueue := make(chan DownloadQueue, 5)
 
+	// array of pathname
+	fileRemovalQueue := make([]Filename, 0, 10)
+
 	dataProducerGroup := sync.WaitGroup{}
 
 	wg.Go(func() {
 		defer close(visitPageQueue)
 
 		for _, url := range parsedURLs {
-			visitPageQueue <- url
+			// NOTE TO SELF:
+			// check ctx.Err will check if the ctx is closed.
+			if ctx.Err() != nil {
+				return
+			}
+
+			// NOTE TO SELF:
+			// even though ctx.Err above will stop all the remaining urls
+			// it doesn't however, stop the waiting-to-send operation, this select does
+			select {
+			case <-ctx.Done():
+				return
+			case visitPageQueue <- url:
+			}
 		}
 	})
 
@@ -413,6 +422,10 @@ func main() {
 				defer wgg.Done()
 
 				for url := range visitPageQueue {
+					if ctx.Err() != nil {
+						return
+					}
+
 					logger.Info("Searching", slog.String("url", url.String()))
 
 					filename := filepath.Join(outdatadir, path.Base(url.Path)) + ".json"
@@ -455,11 +468,6 @@ func main() {
 						}
 
 						total += 1
-
-						// statChange <- Stat{
-						// 	Group: filename,
-						// 	Total: total,
-						// }
 
 						visitDownloadQueue <- VisitDownloadQueue{
 							Group: filename,
@@ -506,6 +514,9 @@ func main() {
 				defer wgg.Done()
 
 				for visitDownload := range visitDownloadQueue {
+					if ctx.Err() != nil {
+						return
+					}
 
 					downUrl, err := GetDownloadURL(&client, visitDownload.Url)
 
@@ -516,13 +527,17 @@ func main() {
 						)
 					}
 
-					dataQueue <- DataQueue{
+					select {
+					case <-ctx.Done():
+						return
+					case dataQueue <- DataQueue{
 						Type: Update,
 						Data: &Data{
 							SongName:     visitDownload.Name,
 							Group:        visitDownload.Group,
 							DownloadURLs: downUrl,
 						},
+					}:
 					}
 				}
 			}()
@@ -539,6 +554,10 @@ func main() {
 		defer close(collectorQueue)
 
 		for data := range dataQueue {
+			if ctx.Err() != nil {
+				return
+			}
+
 			switch data.Type {
 			case Init:
 				group, ok := dataMap[data.Data.Group]
@@ -554,7 +573,11 @@ func main() {
 				result := group[data.Data.SongName]
 				result.DownloadURLs = data.Data.DownloadURLs
 
-				collectorQueue <- result
+				select {
+				case <-ctx.Done():
+					return
+				case collectorQueue <- result:
+				}
 
 				delete(dataMap[data.Data.Group], data.Data.SongName)
 			}
@@ -571,7 +594,13 @@ func main() {
 		collectWait := true
 
 		for statWait || collectWait {
+			if ctx.Err() != nil {
+				return
+			}
+
 			select {
+			case <-ctx.Done():
+				return
 			case stat, ok := <-statChange:
 				if !ok {
 					statWait = false
@@ -621,6 +650,10 @@ func main() {
 			go func() {
 				defer wgg.Done()
 				for write := range writeQueue {
+					if ctx.Err() != nil {
+						return
+					}
+
 					filename := write.Group
 
 					file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
@@ -642,7 +675,11 @@ func main() {
 
 					file.Close()
 
-					readQueue <- filename
+					select {
+					case <-ctx.Done():
+						return
+					case readQueue <- filename:
+					}
 				}
 			}()
 		}
@@ -655,6 +692,10 @@ func main() {
 		defer close(downloadQueue)
 
 		for filename := range readQueue {
+			if ctx.Err() != nil {
+				return
+			}
+
 			file, err := os.Open(filename)
 
 			if err != nil {
@@ -696,20 +737,24 @@ func main() {
 				// TODO: dyanmically choose either flac/mp3 based on user choice, fallback to mp3 if flac unavailable
 				filename := d.SongName + ".mp3"
 				outpath := filepath.Join(outdir, filename)
-				url, err := url.Parse(d.DownloadURLs.MP3)
+				url, err := url.Parse(d.MP3)
 
 				if err != nil {
 					logger.Error("failed to parse download url",
-						slog.String("url", d.DownloadURLs.MP3),
+						slog.String("url", d.MP3),
 						slog.Any("reason", err),
 					)
 					continue
 				}
 
 				if _, exists := existsMap[filename]; !exists {
-					downloadQueue <- DownloadQueue{
+					select {
+					case <-ctx.Done():
+						return
+					case downloadQueue <- DownloadQueue{
 						OutPath: outpath,
 						URL:     url,
+					}:
 					}
 				}
 			}
@@ -729,6 +774,10 @@ func main() {
 			go func() {
 				defer wgg.Done()
 				for download := range downloadQueue {
+					if ctx.Err() != nil {
+						return
+					}
+
 					func() {
 						url := download.URL.String()
 						resp, err := client.Get(url)
@@ -772,14 +821,32 @@ func main() {
 							slog.String("name", filepath.Base(download.OutPath)),
 						)
 
-						if _, err = io.Copy(file, resp.Body); err != nil {
-							logger.Error("failed to write downloaded bytes to a file",
-								slog.String("file", download.OutPath),
-								slog.Any("reason", err),
-							)
+						done := make(chan struct{})
+						defer close(done)
 
-							// remove unfinished file
-							os.Remove(download.OutPath)
+						// stopped by the user
+						intentional := false
+
+						go func() {
+							select {
+							case <-ctx.Done():
+								// either close the writer or the reader to stop the io.Copy
+								// file.Close()
+								intentional = true
+								resp.Body.Close()
+							case <-done:
+							}
+						}()
+
+						if _, err = io.Copy(file, resp.Body); err != nil {
+							if !intentional {
+								logger.Error("Failed to write downloaded bytes to a file",
+									slog.String("file", download.OutPath),
+									slog.Any("reason", err),
+								)
+							}
+
+							fileRemovalQueue = append(fileRemovalQueue, download.OutPath)
 							return
 						}
 					}()
@@ -795,5 +862,32 @@ func main() {
 		close(dataQueue)
 	})
 
+	done := make(chan struct{})
+
+	go func() {
+		wg.Wait()
+		done <- struct{}{}
+	}()
+
+	select {
+	case <-ctx.Done():
+		logger.Info("Cancelling the process", slog.String("reason", "Cancel signal retrieved"))
+	case <-done:
+	}
+
 	wg.Wait()
+
+	if len(fileRemovalQueue) > 0 {
+		logger.Info("Performing removal of unfinished downloaded files")
+
+		for _, filename := range fileRemovalQueue {
+			logger.Info("Removing unfinished file", slog.String("filename", filename))
+			if err = os.Remove(filename); err != nil {
+				logger.Warn("Failed to remove unfinished file",
+					slog.String("filename", filename),
+					slog.Any("reason", err),
+				)
+			}
+		}
+	}
 }
