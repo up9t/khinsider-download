@@ -28,7 +28,7 @@ import (
 // var logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
 var logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-const DefaultOutDataDirectory = "./kids"
+const DefaultOutDataDirectory = "./kidmeta"
 const DefaultOutDownloadDirectory = "./downloads"
 const MaxJobsCountsAtTime = 100
 
