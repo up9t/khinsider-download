@@ -13,7 +13,6 @@ const (
 func ApplyHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", HTTPHeaderUserAgent)
 	req.Header.Set("Accept", HTTPHeaderAccept)
-	// req.Header.Set("Referer", HTTPHeaderReferer)
 	req.Header.Set("Sec-Fetch-Dest", HTTPHeaderSecFetchDest)
 	req.Header.Set("Sec-Fetch-Mode", HTTPHeaderSecFetchMode)
 	req.Header.Set("Sec-Fetch-Site", HTTPHeaderSecFetchSite)
